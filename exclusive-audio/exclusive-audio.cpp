@@ -1,12 +1,14 @@
 // exclusive-audio.cpp : This file contains the 'main' function.
 #pragma comment(lib, "avrt.lib")
 
+#include <chrono>
+#include <iomanip>
 #include <atomic>
+#include <cstdint>
 #include <iostream>
 #include <string>
 #include <vector>
 #include <thread>
-#include <atomic>
 #include <windows.h>
 #include <wrl/client.h>
 #include <mmdeviceapi.h>
@@ -26,8 +28,6 @@ const int REFTIMES_PER_SEC = 10000000;
 const int REFTIMES_PER_MILLISEC = 10000;
 
 // --- CLI Configuration State ---
-
-// --- CLI Configuration State ---
 struct AppConfig {
     std::string mode = "output";  // "input", "output", or "loopback"
     std::string file = "";        // Path to wav file to play
@@ -37,6 +37,24 @@ struct AppConfig {
 };
 
 // --- Helper Functions ---
+#pragma pack(push, 1)
+struct WAVHeader {
+    char riff[4] = { 'R', 'I', 'F', 'F' };
+    uint32_t overall_size = 0;
+    char wave[4] = { 'W', 'A', 'V', 'E' };
+    char fmt_chunk_marker[4] = { 'f', 'm', 't', ' ' };
+    uint32_t length_of_fmt = 16;
+    uint16_t format_type = 1;
+    uint16_t channels = 0;
+    uint32_t sample_rate = 0;
+    uint32_t byterate = 0;
+    uint16_t block_align = 0;
+    uint16_t bits_per_sample = 0;
+    char data_chunk_header[4] = { 'd', 'a', 't', 'a' };
+    uint32_t data_size = 0;
+};
+#pragma pack(pop)
+
 void PrintHelp() {
     std::cout << "PowerGadget 0.1.0\n";
     std::cout << "Copyright 2026 Google Inc\n";
@@ -110,38 +128,45 @@ WAVEFORMATEX* CreateStandardPCMFormat(WORD channels, DWORD sampleRate, WORD bits
 }
 
 // Probes the hardware for a supported exclusive mode format
-HRESULT NegotiateExclusiveFormat(ComPtr<IAudioClient>& pAudioClient, WAVEFORMATEX** ppFormat) {
-    // Array of formats to test: { SampleRate, BitsPerSample }
-    // We test highest quality first, down to standard CD quality.
-    struct FormatConfig { DWORD rate; WORD bits; };
-    // Test our preferred standard formats FIRST
-    FormatConfig formats[] = {
-        { 48000, 16 },
-        { 48000, 24 },
-        { 44100, 24 },
-        { 44100, 16 },
-        // Then fall back to high-res if standard fails
-        { 96000, 24 },
-        { 96000, 16 }
+HRESULT NegotiateExclusiveFormat(ComPtr<IAudioClient>& pAudioClient, WAVEFORMATEX** ppFormat, bool prefer16Bit = true) {
+    // Array of formats to test: { SampleRate, BitsPerSample, Channels }
+    struct FormatConfig { DWORD rate; WORD bits; WORD channels; };
+
+    // We prioritize 16-bit formats if requested, otherwise we try high-res first.
+    // We also test both 2-channel and 1-channel, as many mics are strictly mono.
+    std::vector<FormatConfig> formats = {
+        { 48000, 16, 2 }, { 48000, 16, 1 },
+        { 44100, 16, 2 }, { 44100, 16, 1 },
+        { 48000, 24, 2 }, { 48000, 24, 1 },
+        { 96000, 24, 2 }, { 96000, 24, 1 }
     };
 
     for (const auto& fmt : formats) {
-        WAVEFORMATEX* testFormat = CreateStandardPCMFormat(2, fmt.rate, fmt.bits);
+        WAVEFORMATEX* testFormat = CreateStandardPCMFormat(fmt.channels, fmt.rate, fmt.bits);
 
-        // Ask the hardware: "Do you support this in exclusive mode?"
         HRESULT hr = pAudioClient->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, testFormat, NULL);
 
         if (hr == S_OK) {
-            std::cout << "[Info] Hardware accepted format: " << fmt.rate << "Hz, " << fmt.bits << "-bit.\n";
+            std::cout << "[Info] Hardware negotiated format: "
+                << fmt.rate << "Hz, " << fmt.bits << "-bit, "
+                << fmt.channels << " Channels.\n";
             *ppFormat = testFormat;
             return S_OK;
         }
-
-        // If not supported, free the memory and try the next one in the loop
         CoTaskMemFree(testFormat);
     }
 
-    std::cerr << "[Error] No compatible exclusive mode format found for this device.\n";
+    // If our strict list fails, ask the hardware what it natively wants
+    std::cout << "[Warning] Hardware rejected all standard formats. Falling back to device default...\n";
+    HRESULT hr = pAudioClient->GetMixFormat(ppFormat);
+    if (SUCCEEDED(hr)) {
+        std::cout << "[Info] Device forced default format: "
+            << (*ppFormat)->nSamplesPerSec << "Hz, "
+            << (*ppFormat)->wBitsPerSample << "-bit float, "
+            << (*ppFormat)->nChannels << " Channels.\n";
+        return S_OK;
+    }
+
     return AUDCLNT_E_UNSUPPORTED_FORMAT;
 }
 
@@ -312,44 +337,145 @@ void RunOutputMode(const AppConfig& config) {
 }
 
 void RunInputMode(const AppConfig& config) {
-    if (config.verbose) std::cout << "[Info] Starting Input Mode. Recording to " << std::string(CAPTURE_FILENAME.begin(), CAPTURE_FILENAME.end()) << "\n";
+    if (config.verbose) std::cout << "[Info] Starting Input Mode in Exclusive Mode...\n";
 
     ComPtr<IAudioClient> pAudioClient;
     WAVEFORMATEX* pFormat = nullptr;
 
+    // Use eCapture to get the input device (microphone / line in)
     HRESULT hr = InitExclusiveAudioClient(eCapture, pAudioClient, &pFormat);
     if (FAILED(hr)) {
-        std::cerr << "Failed to initialize capture client.\n";
+        std::cerr << "[Error] Failed to initialize capture client.\n";
         return;
     }
 
     ComPtr<IAudioCaptureClient> pCaptureClient;
-    pAudioClient->GetService(IID_PPV_ARGS(&pCaptureClient));
+    hr = pAudioClient->GetService(IID_PPV_ARGS(&pCaptureClient));
 
     HANDLE hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-    pAudioClient->SetEventHandle(hEvent);
+    hr = pAudioClient->SetEventHandle(hEvent);
 
-    // TODO: Open std::ofstream to write WAV header based on pFormat
+    // Get buffer parameters
+    UINT32 bufferFrameCount;
+    hr = pAudioClient->GetBufferSize(&bufferFrameCount);
+    DWORD bytesPerFrame = pFormat->nBlockAlign;
 
-    pAudioClient->Start();
+    // --- Prepare the Output File ---
+    std::string outFilename = config.file.empty() ? std::string(CAPTURE_FILENAME.begin(), CAPTURE_FILENAME.end()) : config.file;
+    std::ofstream wavFile(outFilename, std::ios::binary);
+    if (!wavFile.is_open()) {
+        std::cerr << "[Error] Could not open output file: " << outFilename << "\n";
+        return;
+    }
 
-    // Capture Loop
-    bool capturing = true;
-    while (capturing) {
-        WaitForSingleObject(hEvent, 2000); // Wait for audio data to be ready
+    // Populate and write a dummy WAV header
+    WAVHeader header;
+    header.channels = pFormat->nChannels;
+    header.sample_rate = pFormat->nSamplesPerSec;
+    header.byterate = pFormat->nAvgBytesPerSec;
+    header.block_align = pFormat->nBlockAlign;
+    header.bits_per_sample = pFormat->wBitsPerSample;
+    wavFile.write(reinterpret_cast<const char*>(&header), sizeof(WAVHeader));
 
-        // 1. Get buffer: pCaptureClient->GetBuffer(...)
-        // 2. Write PCM bytes to your constant WAV file (CAPTURE_FILENAME)
-        // 3. Release buffer: pCaptureClient->ReleaseBuffer(...)
+    uint32_t totalDataBytesWritten = 0;
 
-        if (!config.continuous /* && Check if duration is met */) {
-            capturing = false;
+    // Start the audio engine
+    hr = pAudioClient->Start();
+    if (config.verbose) std::cout << "[Info] Recording started. Writing to " << outFilename << ". Press Ctrl+C to stop.\n";
+
+    g_isPlaying = true;
+    DWORD timeoutMS = ((bufferFrameCount * 1000) / pFormat->nSamplesPerSec) * 5;
+    if (timeoutMS < 100) timeoutMS = 100;
+
+    // --- Time Tracking Variables ---
+    auto startTime = std::chrono::steady_clock::now();
+    auto lastPrintTime = startTime;
+
+    // Print the initial 00:00 state
+    std::cout << "[Info] Recording... [00:00]" << std::flush;
+
+    // --- The Audio Pump ---
+    while (g_isPlaying) {
+        DWORD waitResult = WaitForSingleObject(hEvent, timeoutMS);
+
+        if (waitResult != WAIT_OBJECT_0) {
+            std::cerr << "\n[FATAL EXIT] Device invalidated or timeout.\n";
+            break;
+        }
+
+        // --- Non-blocking UI Heartbeat ---
+        auto currentTime = std::chrono::steady_clock::now();
+        auto elapsedSincePrint = std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastPrintTime).count();
+
+        // Update the UI every second
+        if (elapsedSincePrint >= 1) {
+            auto totalElapsed = std::chrono::duration_cast<std::chrono::seconds>(currentTime - startTime).count();
+            int mins = totalElapsed / 60;
+            int secs = totalElapsed % 60;
+
+            // Use \r to return to the beginning of the line and overwrite it
+            std::cout << "\r[Info] Recording... ["
+                << std::setfill('0') << std::setw(2) << mins << ":"
+                << std::setfill('0') << std::setw(2) << secs << "]" << std::flush;
+
+            lastPrintTime = currentTime;
+        }
+
+        UINT32 packetLength = 0;
+        hr = pCaptureClient->GetNextPacketSize(&packetLength);
+
+        // Pull all available packets from the hardware
+        while (packetLength != 0) {
+            BYTE* pData;
+            UINT32 numFramesAvailable;
+            DWORD flags;
+
+            // 1. Get the captured buffer
+            hr = pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, NULL, NULL);
+            if (FAILED(hr)) break;
+
+            DWORD bytesToWrite = numFramesAvailable * bytesPerFrame;
+
+            // 2. Check if the hardware flagged this packet as silent
+            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                // The hardware dropped audio. Write pure silence to keep timing accurate.
+                for (DWORD i = 0; i < bytesToWrite; ++i) {
+                    wavFile.put(0);
+                }
+            }
+            else {
+                // Write the raw PCM data to disk
+                wavFile.write(reinterpret_cast<const char*>(pData), bytesToWrite);
+            }
+
+            totalDataBytesWritten += bytesToWrite;
+
+            // 3. Release the buffer back to the hardware
+            hr = pCaptureClient->ReleaseBuffer(numFramesAvailable);
+
+            // Get the size of the next packet (if any)
+            hr = pCaptureClient->GetNextPacketSize(&packetLength);
         }
     }
 
+    // Notice the \n to drop down to the next line safely after the \r timer finishes
+    std::cout << "\n[Debug] Recording stopped. Finalizing WAV file...\n";
+
+    // --- Finalize the WAV Header ---
+    // Now that recording is stopped, we know exactly how much data we recorded.
+    // Rewind to the beginning of the file and write the correct file sizes.
+    header.data_size = totalDataBytesWritten;
+    header.overall_size = totalDataBytesWritten + sizeof(WAVHeader) - 8;
+
+    wavFile.seekp(0, std::ios::beg);
+    wavFile.write(reinterpret_cast<const char*>(&header), sizeof(WAVHeader));
+    wavFile.close();
+
+    // Cleanup
     pAudioClient->Stop();
     CloseHandle(hEvent);
     CoTaskMemFree(pFormat);
+    std::cout << "[Info] File saved successfully.\n";
 }
 
 void RunLoopbackMode(const AppConfig& config) {
