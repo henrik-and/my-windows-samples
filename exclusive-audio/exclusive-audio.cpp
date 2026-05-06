@@ -1,6 +1,7 @@
 // exclusive-audio.cpp : This file contains the 'main' function.
 #pragma comment(lib, "avrt.lib")
 
+#include <atomic>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -15,6 +16,9 @@
 #include <algorithm>
 
 using Microsoft::WRL::ComPtr;
+
+// Thread-safe global flag for our audio loops
+std::atomic<bool> g_isPlaying{ true };
 
 // --- Constants & Defaults ---
 const std::wstring CAPTURE_FILENAME = L"exclusive_capture.wav";
@@ -71,6 +75,20 @@ AppConfig ParseArguments(int argc, char* argv[]) {
         }
     }
     return config;
+}
+
+// --- Windows Console Control Handler ---
+BOOL WINAPI ConsoleCtrlHandler(DWORD dwCtrlType) {
+    if (dwCtrlType == CTRL_C_EVENT || dwCtrlType == CTRL_CLOSE_EVENT) {
+        std::cout << "\n[Info] Interrupt received (Ctrl+C). Initiating graceful shutdown...\n";
+
+        // Signal the audio loop to break
+        g_isPlaying = false;
+
+        // Returning TRUE tells Windows: "I handled this, do not forcefully kill the process."
+        return TRUE;
+    }
+    return FALSE;
 }
 
 // --- WASAPI Core Functions ---
@@ -209,7 +227,7 @@ void RunOutputMode(const AppConfig& config) {
     hr = pAudioClient->Start();
     if (config.verbose) std::cout << "[Info] Audio playback started. Press Ctrl+C to stop.\n";
 
-    bool playing = true;
+    g_isPlaying = true; // Ensure it is true before starting
 
     // --- Safe Timeout Calculation ---
     // Calculate expected time for one buffer in milliseconds
@@ -222,7 +240,7 @@ void RunOutputMode(const AppConfig& config) {
         << "ms, Timeout set to: " << timeoutMS << "ms.\n";
 
     // --- The Diagnostic Audio Pump ---
-    while (playing) {
+    while (g_isPlaying) {
         // 1. Wait for the DAC to ask for data
         DWORD waitResult = WaitForSingleObject(hEvent, timeoutMS);
 
@@ -263,7 +281,7 @@ void RunOutputMode(const AppConfig& config) {
 
                 if (!config.continuous) {
                     std::cout << "\n[CLEAN EXIT] Reached end of WAV file.\n";
-                    playing = false; // Cleanly stop next iteration
+                    g_isPlaying = false; // Cleanly stop next iteration
                 }
                 else {
                     // Rewind for continuous play
@@ -346,6 +364,11 @@ void RunLoopbackMode(const AppConfig& config) {
 }
 
 int main(int argc, char* argv[]) {
+    // Register the Ctrl+C handler
+    if (!SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE)) {
+        std::cerr << "[Warning] Could not set control handler. Ctrl+C will forcefully exit.\n";
+    }
+
     AppConfig config = ParseArguments(argc, argv);
 
     // Initialize COM on the main thread (Apartment Threaded)
