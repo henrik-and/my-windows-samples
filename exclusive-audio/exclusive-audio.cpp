@@ -26,6 +26,8 @@ std::atomic<bool> g_isPlaying{ true };
 const std::wstring CAPTURE_FILENAME = L"exclusive_capture.wav";
 const int REFTIMES_PER_SEC = 10000000;
 const int REFTIMES_PER_MILLISEC = 10000;
+// 1.0f is original volume. 2.0f is double (+6dB). 4.0f is quadruple (+12dB).
+const float SOFTWARE_GAIN = 10.0f;
 
 // --- CLI Configuration State ---
 struct AppConfig {
@@ -55,6 +57,64 @@ struct WAVHeader {
     uint32_t data_size = 0;
 };
 #pragma pack(pop)
+
+class MinimalRingBuffer {
+private:
+    std::vector<BYTE> buffer;
+    size_t capacity;
+    std::atomic<size_t> writeHead{ 0 };
+    std::atomic<size_t> readHead{ 0 };
+
+public:
+    MinimalRingBuffer(size_t size) : capacity(size) {
+        buffer.resize(size, 0);
+    }
+
+    void Write(const BYTE* data, size_t size) {
+        size_t w = writeHead.load(std::memory_order_relaxed);
+        size_t r = readHead.load(std::memory_order_acquire);
+
+        // If buffer is full, drop the frame to prevent a crash
+        if (size > capacity - (w - r)) return;
+
+        size_t offset = w % capacity;
+        size_t spaceUntilWrap = capacity - offset;
+
+        if (size <= spaceUntilWrap) {
+            memcpy(&buffer[offset], data, size);
+        }
+        else {
+            memcpy(&buffer[offset], data, spaceUntilWrap);
+            memcpy(&buffer[0], data + spaceUntilWrap, size - spaceUntilWrap);
+        }
+        writeHead.store(w + size, std::memory_order_release);
+    }
+
+    void Read(BYTE* data, size_t size) {
+        size_t w = writeHead.load(std::memory_order_acquire);
+        size_t r = readHead.load(std::memory_order_relaxed);
+
+        // If we underrun, play silence (this shouldn't happen with our staggered start)
+        if (size > (w - r)) {
+            memset(data, 0, size);
+            return;
+        }
+
+        size_t offset = r % capacity;
+        size_t spaceUntilWrap = capacity - offset;
+
+        if (size <= spaceUntilWrap) {
+            memcpy(data, &buffer[offset], size);
+        }
+        else {
+            memcpy(data, &buffer[offset], spaceUntilWrap);
+            memcpy(data + spaceUntilWrap, &buffer[0], size - spaceUntilWrap);
+        }
+        readHead.store(r + size, std::memory_order_release);
+    }
+};
+
+MinimalRingBuffer* g_pRingBuffer = nullptr;
 
 void PrintHelp() {
     std::cout << "PowerGadget 0.1.0\n";
@@ -347,7 +407,7 @@ void RunInputMode(const AppConfig& config) {
     ComPtr<IAudioClient> pAudioClient;
     WAVEFORMATEX* pFormat = nullptr;
 
-    // Use eCapture to get the input device (microphone / line in)
+    // Initialize the hardware capture client
     HRESULT hr = InitExclusiveAudioClient(eCapture, pAudioClient, &pFormat);
     if (FAILED(hr)) {
         std::cerr << "[Error] Failed to initialize capture client.\n";
@@ -360,7 +420,6 @@ void RunInputMode(const AppConfig& config) {
     HANDLE hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
     hr = pAudioClient->SetEventHandle(hEvent);
 
-    // Get buffer parameters
     UINT32 bufferFrameCount;
     hr = pAudioClient->GetBufferSize(&bufferFrameCount);
     DWORD bytesPerFrame = pFormat->nBlockAlign;
@@ -392,106 +451,74 @@ void RunInputMode(const AppConfig& config) {
     DWORD timeoutMS = ((bufferFrameCount * 1000) / pFormat->nSamplesPerSec) * 5;
     if (timeoutMS < 100) timeoutMS = 100;
 
-    // --- Time Tracking Variables ---
+    // Time Tracking
     auto startTime = std::chrono::steady_clock::now();
     auto lastPrintTime = startTime;
-
-    // Print the initial 00:00 state
     std::cout << "[Info] Recording... [00:00]" << std::flush;
 
     // --- The Audio Pump ---
     while (g_isPlaying) {
+        // 1. Wait for the exact moment the hardware is ready
         DWORD waitResult = WaitForSingleObject(hEvent, timeoutMS);
-
         if (waitResult != WAIT_OBJECT_0) {
             std::cerr << "\n[FATAL EXIT] Device invalidated or timeout.\n";
             break;
         }
 
-        // --- Non-blocking UI Heartbeat ---
+        // --- UI Heartbeat (Updates every 1 second) ---
         auto currentTime = std::chrono::steady_clock::now();
         auto elapsedSincePrint = std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastPrintTime).count();
-
-        // Update the UI every second
         if (elapsedSincePrint >= 1) {
             auto totalElapsed = std::chrono::duration_cast<std::chrono::seconds>(currentTime - startTime).count();
             int mins = totalElapsed / 60;
             int secs = totalElapsed % 60;
-
-            // Use \r to return to the beginning of the line and overwrite it
             std::cout << "\r[Info] Recording... ["
                 << std::setfill('0') << std::setw(2) << mins << ":"
                 << std::setfill('0') << std::setw(2) << secs << "]" << std::flush;
-
             lastPrintTime = currentTime;
         }
 
-        UINT32 packetLength = 0;
-        hr = pCaptureClient->GetNextPacketSize(&packetLength);
+        BYTE* pData;
+        UINT32 numFramesAvailable;
+        DWORD flags;
 
-        // Pull all available packets from the hardware
-        while (packetLength != 0) {
-            BYTE* pData;
-            UINT32 numFramesAvailable;
-            DWORD flags;
+        // 2. IMMEDIATELY grab the buffer. NO GetNextPacketSize loop!
+        hr = pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, NULL, NULL);
+        if (FAILED(hr)) continue; // Safe skip if driver isn't ready
 
-            // 1. Get the captured buffer
-            hr = pCaptureClient->GetBuffer(&pData, &numFramesAvailable, &flags, NULL, NULL);
-            if (FAILED(hr)) break;
+        DWORD bytesToWrite = numFramesAvailable * bytesPerFrame;
 
-            DWORD bytesToWrite = numFramesAvailable * bytesPerFrame;
-
-            // 2. Check if the hardware flagged this packet as silent
-            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                // The hardware dropped audio. Write pure silence to keep timing accurate.
-                for (DWORD i = 0; i < bytesToWrite; ++i) {
-                    wavFile.put(0);
-                }
-            }
-            else {
-                // --- APPLY SOFTWARE GAIN TO 16-BIT AUDIO ---
-                // 1.0f is original volume. 2.0f is double (+6dB). 4.0f is quadruple (+12dB).
-                const float SOFTWARE_GAIN = 10.0f;
-
-                // Cast the raw byte buffer to an array of 16-bit integers
+        // 3. Process the data safely
+        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+            // Hardware dropped a frame; write pure silence to maintain perfect file length
+            for (DWORD i = 0; i < bytesToWrite; ++i) wavFile.put(0);
+        }
+        else {
+            // Apply Software Gain for 16-bit
+            if (pFormat->wBitsPerSample == 16) {
                 int16_t* pInt16Data = reinterpret_cast<int16_t*>(pData);
-
-                // Calculate total individual samples (Frames * Channels)
                 uint32_t numSamples = bytesToWrite / sizeof(int16_t);
 
-                // Modify the buffer in place before writing it to disk
                 for (uint32_t i = 0; i < numSamples; ++i) {
-                    // Multiply the sample by our gain using a float to prevent immediate overflow
                     float boostedSample = pInt16Data[i] * SOFTWARE_GAIN;
-
-                    // Hard clipping safety: clamp to the maximum physical limits of 16-bit audio
                     if (boostedSample > 32767.0f) boostedSample = 32767.0f;
                     if (boostedSample < -32768.0f) boostedSample = -32768.0f;
-
-                    // Assign the safely boosted value back into the array
                     pInt16Data[i] = static_cast<int16_t>(boostedSample);
                 }
-
-                // Write the now-boosted PCM data to disk
-                wavFile.write(reinterpret_cast<const char*>(pData), bytesToWrite);
             }
-
-            totalDataBytesWritten += bytesToWrite;
-
-            // 3. Release the buffer back to the hardware
-            hr = pCaptureClient->ReleaseBuffer(numFramesAvailable);
-
-            // Get the size of the next packet (if any)
-            hr = pCaptureClient->GetNextPacketSize(&packetLength);
+            // Write the PCM data to disk
+            wavFile.write(reinterpret_cast<const char*>(pData), bytesToWrite);
         }
+
+        totalDataBytesWritten += bytesToWrite;
+
+        // 4. Release the buffer back to the hardware
+        hr = pCaptureClient->ReleaseBuffer(numFramesAvailable);
     }
 
-    // Notice the \n to drop down to the next line safely after the \r timer finishes
     std::cout << "\n[Debug] Recording stopped. Finalizing WAV file...\n";
 
     // --- Finalize the WAV Header ---
-    // Now that recording is stopped, we know exactly how much data we recorded.
-    // Rewind to the beginning of the file and write the correct file sizes.
     header.data_size = totalDataBytesWritten;
     header.overall_size = totalDataBytesWritten + sizeof(WAVHeader) - 8;
 
@@ -499,7 +526,6 @@ void RunInputMode(const AppConfig& config) {
     wavFile.write(reinterpret_cast<const char*>(&header), sizeof(WAVHeader));
     wavFile.close();
 
-    // Cleanup
     pAudioClient->Stop();
     CloseHandle(hEvent);
     CoTaskMemFree(pFormat);
@@ -507,14 +533,152 @@ void RunInputMode(const AppConfig& config) {
 }
 
 void RunLoopbackMode(const AppConfig& config) {
-    if (config.verbose) std::cout << "[Info] Starting Loopback Mode (Capture -> Render)...\n";
-    // Loopback requires setting up both the Capture and Render clients in Exclusive mode.
-    // Because clocks drift between physical input and output hardware, you will need to implement
-    // a circular ring buffer (lock-free is best) between the capture thread and the render thread.
+    if (config.verbose) std::cout << "[Info] Starting Loopback Mode (Static Gain)...\n";
 
-    // Thread 1: Runs logic similar to RunInputMode, pushing data into a thread-safe ring buffer.
-    // Thread 2: Runs logic similar to RunOutputMode, pulling data from the ring buffer.
-    std::cout << "Loopback architecture requires threading and a lock-free ring buffer.\n";
+    ComPtr<IAudioClient> pRenderClient;
+    ComPtr<IAudioClient> pCaptureClient;
+    WAVEFORMATEX* pRenderFormat = nullptr;
+    WAVEFORMATEX* pCaptureFormat = nullptr;
+
+    if (FAILED(InitExclusiveAudioClient(eRender, pRenderClient, &pRenderFormat))) return;
+    if (FAILED(InitExclusiveAudioClient(eCapture, pCaptureClient, &pCaptureFormat))) return;
+
+    if (pRenderFormat->nSamplesPerSec != pCaptureFormat->nSamplesPerSec ||
+        pRenderFormat->nChannels != pCaptureFormat->nChannels ||
+        pRenderFormat->wBitsPerSample != pCaptureFormat->wBitsPerSample) {
+        std::cerr << "\n[FATAL ERROR] Format mismatch! Resampler required.\n";
+        return;
+    }
+
+    g_pRingBuffer = new MinimalRingBuffer(pRenderFormat->nAvgBytesPerSec);
+
+    ComPtr<IAudioRenderClient> pRenderService;
+    ComPtr<IAudioCaptureClient> pCaptureService;
+    pRenderClient->GetService(IID_PPV_ARGS(&pRenderService));
+    pCaptureClient->GetService(IID_PPV_ARGS(&pCaptureService));
+
+    HANDLE hRenderEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    HANDLE hCaptureEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    pRenderClient->SetEventHandle(hRenderEvent);
+    pCaptureClient->SetEventHandle(hCaptureEvent);
+
+    UINT32 renderBufferFrameCount, captureBufferFrameCount;
+    pRenderClient->GetBufferSize(&renderBufferFrameCount);
+    pCaptureClient->GetBufferSize(&captureBufferFrameCount);
+
+    g_isPlaying = true;
+
+    // ==========================================
+    // THREAD 1: The Capture Pump (Simple Gain)
+    // ==========================================
+    std::thread captureThread([&]() {
+        DWORD timeoutMS = ((captureBufferFrameCount * 1000) / pCaptureFormat->nSamplesPerSec) * 5;
+        if (timeoutMS < 100) timeoutMS = 100;
+        DWORD bytesPerFrame = pCaptureFormat->nBlockAlign;
+
+        std::vector<BYTE> processBuffer;
+
+        while (g_isPlaying) {
+            if (WaitForSingleObject(hCaptureEvent, timeoutMS) != WAIT_OBJECT_0) break;
+
+            BYTE* pData;
+            UINT32 numFramesAvailable;
+            DWORD flags;
+
+            HRESULT hr = pCaptureService->GetBuffer(&pData, &numFramesAvailable, &flags, NULL, NULL);
+            if (FAILED(hr)) continue;
+
+            DWORD bytesToWrite = numFramesAvailable * bytesPerFrame;
+
+            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                std::vector<BYTE> silence(bytesToWrite, 0);
+                g_pRingBuffer->Write(silence.data(), bytesToWrite);
+            }
+            else {
+                // Resize our safe local buffer to avoid DMA memory violations
+                processBuffer.resize(bytesToWrite);
+
+                if (pCaptureFormat->wBitsPerSample == 16) {
+                    const int16_t* pIn = reinterpret_cast<const int16_t*>(pData);
+                    int16_t* pOut = reinterpret_cast<int16_t*>(processBuffer.data());
+                    uint32_t numSamples = bytesToWrite / sizeof(int16_t);
+
+                    for (uint32_t i = 0; i < numSamples; ++i) {
+                        float boosted = pIn[i] * SOFTWARE_GAIN;
+
+                        // Hard clipping safety net
+                        if (boosted > 32767.0f) boosted = 32767.0f;
+                        if (boosted < -32768.0f) boosted = -32768.0f;
+
+                        pOut[i] = static_cast<int16_t>(boosted);
+                    }
+                }
+                else {
+                    // Fallback copy without gain
+                    memcpy(processBuffer.data(), pData, bytesToWrite);
+                }
+
+                // Push the safely boosted buffer to the bridge
+                g_pRingBuffer->Write(processBuffer.data(), bytesToWrite);
+            }
+
+            pCaptureService->ReleaseBuffer(numFramesAvailable);
+        }
+        });
+
+    // ==========================================
+    // THREAD 2: The Render Pump
+    // ==========================================
+    std::thread renderThread([&]() {
+        DWORD timeoutMS = ((renderBufferFrameCount * 1000) / pRenderFormat->nSamplesPerSec) * 5;
+        if (timeoutMS < 100) timeoutMS = 100;
+        DWORD bytesPerFrame = pRenderFormat->nBlockAlign;
+
+        while (g_isPlaying) {
+            if (WaitForSingleObject(hRenderEvent, timeoutMS) != WAIT_OBJECT_0) break;
+
+            BYTE* pData;
+            HRESULT hr = pRenderService->GetBuffer(renderBufferFrameCount, &pData);
+            if (FAILED(hr)) break;
+
+            DWORD bytesToRead = renderBufferFrameCount * bytesPerFrame;
+
+            g_pRingBuffer->Read(pData, bytesToRead);
+
+            pRenderService->ReleaseBuffer(renderBufferFrameCount, 0);
+        }
+        });
+
+    // ==========================================
+    // THE STAGGERED START (Crucial for stability)
+    // ==========================================
+    pCaptureClient->Start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    pRenderClient->Start();
+
+    // ==========================================
+    // MAIN THREAD: Keep application alive
+    // ==========================================
+    std::cout << "[Info] Loopback Active! (Press Ctrl+C to stop)\n";
+    while (g_isPlaying) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    std::cout << "\n[Debug] Shutting down streams...\n";
+
+    pRenderClient->Stop();
+    pCaptureClient->Stop();
+
+    if (captureThread.joinable()) captureThread.join();
+    if (renderThread.joinable()) renderThread.join();
+
+    CloseHandle(hRenderEvent);
+    CloseHandle(hCaptureEvent);
+    CoTaskMemFree(pRenderFormat);
+    CoTaskMemFree(pCaptureFormat);
+    delete g_pRingBuffer;
+
+    std::cout << "[Info] Loopback safely terminated.\n";
 }
 
 int main(int argc, char* argv[]) {
