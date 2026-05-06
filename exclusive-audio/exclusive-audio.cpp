@@ -29,11 +29,12 @@ const int REFTIMES_PER_MILLISEC = 10000;
 
 // --- CLI Configuration State ---
 struct AppConfig {
-    std::string mode = "output";  // "input", "output", or "loopback"
-    std::string file = "";        // Path to wav file to play
+    std::string mode = "output";
+    std::string file = "";
     int duration = 0;
     bool continuous = true;
     bool verbose = false;
+    bool playAfterRecord = false;
 };
 
 // --- Helper Functions ---
@@ -63,6 +64,7 @@ void PrintHelp() {
     std::cout << "  -f, --file          (Default: '') Path to input wav file for output mode.\n";
     std::cout << "  -d, --duration      (Default: 0 sec) Duration to run in seconds.\n";
     std::cout << "  -o, --once          (Default: false) Play the file only once and exit.\n";
+    std::cout << "  -p, --play          (Default: false) Play back the recorded file after Ctrl+C (Input mode only).\n";
     std::cout << "  -v, --verbose       (Default: false) Verbose output.\n";
     std::cout << "  --help              Display this help screen.\n";
 }
@@ -86,7 +88,10 @@ AppConfig ParseArguments(int argc, char* argv[]) {
             config.duration = std::stoi(args[++i]);
         }
         else if (args[i] == "-o" || args[i] == "--once") {
-            config.continuous = false; // <-- Allow opting out of the loop
+            config.continuous = false;
+        }
+        else if (args[i] == "-p" || args[i] == "--play") {
+            config.playAfterRecord = true;
         }
         else if (args[i] == "-v" || args[i] == "--verbose") {
             config.verbose = true;
@@ -513,6 +518,40 @@ int main(int argc, char* argv[]) {
     }
     else if (config.mode == "input") {
         RunInputMode(config);
+        
+        if (config.playAfterRecord) {
+            // 1. Reset the global flag so Ctrl+C works again for playback
+            g_isPlaying = true;
+
+            // 2. Ensure Output Mode knows exactly what file we just made
+            if (config.file.empty()) {
+                config.file = std::string(CAPTURE_FILENAME.begin(), CAPTURE_FILENAME.end());
+            }
+
+            // 3. Read the exact duration from the new WAV file's header
+            double durationSecs = 0.0;
+            std::ifstream checkFile(config.file, std::ios::binary);
+            if (checkFile.is_open()) {
+                WAVHeader parsedHeader;
+                checkFile.read(reinterpret_cast<char*>(&parsedHeader), sizeof(WAVHeader));
+                if (parsedHeader.byterate > 0) {
+                    // Duration = Total Audio Bytes / Bytes per Second
+                    durationSecs = static_cast<double>(parsedHeader.data_size) / parsedHeader.byterate;
+                }
+                checkFile.close();
+            }
+
+            // 4. Print the formatted message
+            std::cout << "\n[Info] Initiating playback of recorded file: "
+                << config.file << " ("
+                << std::fixed << std::setprecision(2) << durationSecs << " seconds)...\n";
+
+            // 5. Force it to only play once instead of looping forever
+            config.continuous = false;
+
+            // 6. Start the output engine
+            RunOutputMode(config);
+        }
     }
     else if (config.mode == "loopback") {
         RunLoopbackMode(config);
