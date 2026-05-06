@@ -425,7 +425,13 @@ void RunInputMode(const AppConfig& config) {
     DWORD bytesPerFrame = pFormat->nBlockAlign;
 
     // --- Prepare the Output File ---
-    std::string outFilename = config.file.empty() ? std::string(CAPTURE_FILENAME.begin(), CAPTURE_FILENAME.end()) : config.file;
+    std::string outFilename = config.file;
+    if (outFilename.empty()) {
+        // EXPLICIT CAST: Safely convert the wide string to a standard string
+        for (wchar_t c : CAPTURE_FILENAME) {
+            outFilename.push_back(static_cast<char>(c));
+        }
+    }
     std::ofstream wavFile(outFilename, std::ios::binary);
     if (!wavFile.is_open()) {
         std::cerr << "[Error] Could not open output file: " << outFilename << "\n";
@@ -470,8 +476,8 @@ void RunInputMode(const AppConfig& config) {
         auto elapsedSincePrint = std::chrono::duration_cast<std::chrono::seconds>(currentTime - lastPrintTime).count();
         if (elapsedSincePrint >= 1) {
             auto totalElapsed = std::chrono::duration_cast<std::chrono::seconds>(currentTime - startTime).count();
-            int mins = totalElapsed / 60;
-            int secs = totalElapsed % 60;
+            int mins = static_cast<int>(totalElapsed / 60);
+            int secs = static_cast<int>(totalElapsed % 60);
             std::cout << "\r[Info] Recording... ["
                 << std::setfill('0') << std::setw(2) << mins << ":"
                 << std::setfill('0') << std::setw(2) << secs << "]" << std::flush;
@@ -712,7 +718,9 @@ int main(int argc, char* argv[]) {
 
             // 2. Ensure Output Mode knows exactly what file we just made
             if (config.file.empty()) {
-                config.file = std::string(CAPTURE_FILENAME.begin(), CAPTURE_FILENAME.end());
+                for (wchar_t c : CAPTURE_FILENAME) {
+                    config.file.push_back(static_cast<char>(c));
+                }
             }
 
             // 3. Read the exact duration from the new WAV file's header
