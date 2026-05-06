@@ -22,23 +22,25 @@ const int REFTIMES_PER_SEC = 10000000;
 const int REFTIMES_PER_MILLISEC = 10000;
 
 // --- CLI Configuration State ---
+
+// --- CLI Configuration State ---
 struct AppConfig {
-    std::string mode = "output"; // "input", "output", or "loopback"
-    std::string file = "";       // Path to wav file to play
+    std::string mode = "output";  // "input", "output", or "loopback"
+    std::string file = "";        // Path to wav file to play
     int duration = 0;
-    bool continuous = false;
+    bool continuous = true;
     bool verbose = false;
 };
 
 // --- Helper Functions ---
 void PrintHelp() {
-    std::cout << "ExclusiveAudioDemo 0.1.0\n";
+    std::cout << "PowerGadget 0.1.0\n";
     std::cout << "Copyright 2026 Google Inc\n";
     std::cout << "USAGE:\n\n";
     std::cout << "  -m, --mode          (Default: output) Mode: 'input', 'output', or 'loopback'.\n";
     std::cout << "  -f, --file          (Default: '') Path to input wav file for output mode.\n";
     std::cout << "  -d, --duration      (Default: 0 sec) Duration to run in seconds.\n";
-    std::cout << "  -c, --continuous    (Default: false) Run forever. Stop by pressing Ctrl+C.\n";
+    std::cout << "  -o, --once          (Default: false) Play the file only once and exit.\n";
     std::cout << "  -v, --verbose       (Default: false) Verbose output.\n";
     std::cout << "  --help              Display this help screen.\n";
 }
@@ -61,8 +63,8 @@ AppConfig ParseArguments(int argc, char* argv[]) {
         else if ((args[i] == "-d" || args[i] == "--duration") && i + 1 < args.size()) {
             config.duration = std::stoi(args[++i]);
         }
-        else if (args[i] == "-c" || args[i] == "--continuous") {
-            config.continuous = true;
+        else if (args[i] == "-o" || args[i] == "--once") {
+            config.continuous = false; // <-- Allow opting out of the loop
         }
         else if (args[i] == "-v" || args[i] == "--verbose") {
             config.verbose = true;
