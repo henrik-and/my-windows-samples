@@ -11,6 +11,8 @@
 #include <mmdeviceapi.h>
 #include <audioclient.h>
 #include <avrt.h>
+#include <fstream>
+#include <algorithm>
 
 using Microsoft::WRL::ComPtr;
 
@@ -94,8 +96,8 @@ HRESULT NegotiateExclusiveFormat(ComPtr<IAudioClient>& pAudioClient, WAVEFORMATE
     struct FormatConfig { DWORD rate; WORD bits; };
     // Test our preferred standard formats FIRST
     FormatConfig formats[] = {
-        { 48000, 24 },
         { 48000, 16 },
+        { 48000, 24 },
         { 44100, 24 },
         { 44100, 16 },
         // Then fall back to high-res if standard fails
@@ -162,39 +164,131 @@ void RunOutputMode(const AppConfig& config) {
 
     HRESULT hr = InitExclusiveAudioClient(eRender, pAudioClient, &pFormat);
     if (FAILED(hr)) {
-        std::cerr << "Failed to initialize render client. Is the format supported in exclusive mode?\n";
+        std::cerr << "[Error] Failed to initialize render client.\n";
         return;
     }
 
     ComPtr<IAudioRenderClient> pRenderClient;
-    pAudioClient->GetService(IID_PPV_ARGS(&pRenderClient));
+    hr = pAudioClient->GetService(IID_PPV_ARGS(&pRenderClient));
 
+    // Create the event that WASAPI will signal when it needs more data
     HANDLE hEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-    pAudioClient->SetEventHandle(hEvent);
+    hr = pAudioClient->SetEventHandle(hEvent);
 
-    // TODO: Load WAV file (config.file) into memory, ensuring it matches pFormat->nSamplesPerSec.
+    // In Exclusive Event-Driven mode, the buffer size is fixed and dictated by your Initialize call
+    UINT32 bufferFrameCount;
+    hr = pAudioClient->GetBufferSize(&bufferFrameCount);
 
-    pAudioClient->Start();
-    if (config.verbose) std::cout << "[Info] Audio playback started.\n";
+    DWORD bytesPerFrame = pFormat->nBlockAlign;
+    DWORD bufferSizeBytes = bufferFrameCount * bytesPerFrame;
 
-    // Playback Loop
+    // --- Open the WAV File ---
+    std::ifstream wavFile;
+    if (!config.file.empty()) {
+        wavFile.open(config.file, std::ios::binary);
+        if (!wavFile.is_open()) {
+            std::cerr << "[Error] Could not open WAV file: " << config.file << "\n";
+            return;
+        }
+        // Note: For a production app, you must parse the WAV header (the first 44 bytes) 
+        // to ensure it matches pFormat, and then seek past it to the raw PCM data.
+        // For this demo, we are just skipping a generic 44-byte header.
+        wavFile.seekg(44, std::ios::beg);
+    }
+
+    // --- Pre-Roll ---
+    // You MUST fill the first buffer before starting the clock, otherwise it glitches instantly.
+    BYTE* pData;
+    hr = pRenderClient->GetBuffer(bufferFrameCount, &pData);
+    memset(pData, 0, bufferSizeBytes); // Fill with silence
+    hr = pRenderClient->ReleaseBuffer(bufferFrameCount, 0);
+
+    // Start the audio engine
+    hr = pAudioClient->Start();
+    if (config.verbose) std::cout << "[Info] Audio playback started. Press Ctrl+C to stop.\n";
+
     bool playing = true;
+
+    // --- Safe Timeout Calculation ---
+    // Calculate expected time for one buffer in milliseconds
+    DWORD bufferTimeMS = (bufferFrameCount * 1000) / pFormat->nSamplesPerSec;
+    // Set timeout to 5x the buffer time to prevent false positives from slight CPU spikes
+    DWORD timeoutMS = bufferTimeMS * 5;
+    if (timeoutMS < 100) timeoutMS = 100; // Minimum 100ms timeout for safety
+
+    std::cout << "[Debug] Audio loop starting. Buffer time: " << bufferTimeMS
+        << "ms, Timeout set to: " << timeoutMS << "ms.\n";
+
+    // --- The Diagnostic Audio Pump ---
     while (playing) {
-        WaitForSingleObject(hEvent, 2000); // Wait for the audio engine to ask for data
+        // 1. Wait for the DAC to ask for data
+        DWORD waitResult = WaitForSingleObject(hEvent, timeoutMS);
 
-        // 1. Get buffer size: pAudioClient->GetBufferSize(...)
-        // 2. Request buffer: pRenderClient->GetBuffer(...)
-        // 3. Copy PCM data from your WAV file to the buffer
-        // 4. Release buffer: pRenderClient->ReleaseBuffer(...)
+        if (waitResult != WAIT_OBJECT_0) {
+            if (waitResult == WAIT_TIMEOUT) {
+                std::cerr << "\n[FATAL EXIT] WaitForSingleObject TIMEOUT!\n";
+                std::cerr << "The audio engine stopped signaling the event handle. "
+                    << "The device was likely invalidated or hijacked by another app.\n";
+            }
+            else if (waitResult == WAIT_FAILED) {
+                std::cerr << "\n[FATAL EXIT] WaitForSingleObject FAILED. Win32 Error: " << GetLastError() << "\n";
+            }
+            else {
+                std::cerr << "\n[FATAL EXIT] WaitForSingleObject returned unknown code: " << waitResult << "\n";
+            }
+            break; // Exit loop
+        }
 
-        if (!config.continuous /* && Check if duration/file is done */) {
-            playing = false;
+        // 2. Request the buffer from the hardware
+        hr = pRenderClient->GetBuffer(bufferFrameCount, &pData);
+        if (hr == AUDCLNT_E_BUFFER_ERROR) {
+            std::cout << "[Warning] Buffer error (glitch). Skipping a frame...\n";
+            continue;
+        }
+        else if (FAILED(hr)) {
+            std::cerr << "\n[FATAL EXIT] GetBuffer failed. HRESULT: 0x" << std::hex << hr << std::dec << "\n";
+            if (hr == AUDCLNT_E_DEVICE_INVALIDATED) std::cerr << "(Error: AUDCLNT_E_DEVICE_INVALIDATED)\n";
+            break; // Exit loop
+        }
+
+        // 3. Fill the buffer
+        if (wavFile.is_open() && !wavFile.eof()) {
+            wavFile.read(reinterpret_cast<char*>(pData), bufferSizeBytes);
+            std::streamsize bytesRead = wavFile.gcount();
+
+            if (bytesRead < bufferSizeBytes) {
+                memset(pData + bytesRead, 0, bufferSizeBytes - bytesRead);
+
+                if (!config.continuous) {
+                    std::cout << "\n[CLEAN EXIT] Reached end of WAV file.\n";
+                    playing = false; // Cleanly stop next iteration
+                }
+                else {
+                    // Rewind for continuous play
+                    wavFile.clear();
+                    wavFile.seekg(44, std::ios::beg);
+                }
+            }
+        }
+        else {
+            memset(pData, 0, bufferSizeBytes);
+        }
+
+        // 4. Hand the buffer back to the hardware
+        hr = pRenderClient->ReleaseBuffer(bufferFrameCount, 0);
+        if (FAILED(hr)) {
+            std::cerr << "\n[FATAL EXIT] ReleaseBuffer failed. HRESULT: 0x" << std::hex << hr << std::dec << "\n";
+            break; // Exit loop
         }
     }
 
+    std::cout << "[Debug] Escaped the audio loop. Cleaning up...\n";
+
+    // Cleanup
     pAudioClient->Stop();
     CloseHandle(hEvent);
     CoTaskMemFree(pFormat);
+    if (wavFile.is_open()) wavFile.close();
 }
 
 void RunInputMode(const AppConfig& config) {
