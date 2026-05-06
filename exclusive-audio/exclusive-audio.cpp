@@ -449,7 +449,30 @@ void RunInputMode(const AppConfig& config) {
                 }
             }
             else {
-                // Write the raw PCM data to disk
+                // --- APPLY SOFTWARE GAIN TO 16-BIT AUDIO ---
+                // 1.0f is original volume. 2.0f is double (+6dB). 4.0f is quadruple (+12dB).
+                const float SOFTWARE_GAIN = 10.0f;
+
+                // Cast the raw byte buffer to an array of 16-bit integers
+                int16_t* pInt16Data = reinterpret_cast<int16_t*>(pData);
+
+                // Calculate total individual samples (Frames * Channels)
+                uint32_t numSamples = bytesToWrite / sizeof(int16_t);
+
+                // Modify the buffer in place before writing it to disk
+                for (uint32_t i = 0; i < numSamples; ++i) {
+                    // Multiply the sample by our gain using a float to prevent immediate overflow
+                    float boostedSample = pInt16Data[i] * SOFTWARE_GAIN;
+
+                    // Hard clipping safety: clamp to the maximum physical limits of 16-bit audio
+                    if (boostedSample > 32767.0f) boostedSample = 32767.0f;
+                    if (boostedSample < -32768.0f) boostedSample = -32768.0f;
+
+                    // Assign the safely boosted value back into the array
+                    pInt16Data[i] = static_cast<int16_t>(boostedSample);
+                }
+
+                // Write the now-boosted PCM data to disk
                 wavFile.write(reinterpret_cast<const char*>(pData), bytesToWrite);
             }
 
