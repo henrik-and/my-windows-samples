@@ -117,7 +117,7 @@ public:
 MinimalRingBuffer* g_pRingBuffer = nullptr;
 
 void PrintHelp() {
-    std::cout << "PowerGadget 0.1.0\n";
+    std::cout << "exclusive-audio 1.0.0\n";
     std::cout << "Copyright 2026 Google Inc\n";
     std::cout << "USAGE:\n\n";
     std::cout << "  -m, --mode          (Default: output) Mode: 'input', 'output', or 'loopback'.\n";

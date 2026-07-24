@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="exclusive-audio.vcxproj" />
+  <Project Path="exclusive-audio.vcxproj" Id="2ed688a2-9892-4c67-a994-7eef7db6795d" />
 </Solution>
